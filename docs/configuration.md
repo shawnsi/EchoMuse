@@ -96,6 +96,17 @@ little speaker is boomy and dull by default.
 An extra presence bump for spoken responses. Try it if responses sound
 muffled from across the room.
 
+### Response level
+Sets spoken responses relative to the device's normal volume: **Low** keeps
+the existing level, **Medium** adds 6dB, and **High** adds 12dB. The volume
+buttons still move both media and responses together; this setting only makes
+voice louder within that range. Near maximum volume the extra boost tapers
+away, reaching none at maximum, so it cannot drive the output above full
+scale. The wake sound remains independent and uses Wake sound level.
+
+Older firmware cannot apply this gain. Its control is disabled for those
+devices and explains that newer firmware is required.
+
 ### Speak while the reply is written
 Off by default. When it is off, the Dot starts speaking once Home Assistant
 has the whole reply. When it is on, it starts as soon as Home Assistant has the
@@ -266,7 +277,8 @@ Home Assistant only reads a satellite's wake word configuration when it
 connects, so the controller drops and remakes that connection to make the new
 name show up. It takes a few milliseconds, but during it **every entity for
 that device goes unavailable and comes straight back** — the voice assistant,
-the media player, the action button, the ambient light sensor.
+the media player, the action button, the ambient light sensor and the
+Microphone Muted sensor.
 
 That matters if you have an automation using a **state trigger** on any of
 them: coming back online is a state change, and the automation will fire. The
@@ -591,6 +603,14 @@ can't wipe it the instant it appears — but **pressing the action button
 cancels it immediately**, so adjusting the volume and then talking to the
 device still shows you the listening ring straight away.
 
+**Remote volume arc** is an opt-in accessibility setting. When enabled, a
+volume change from Home Assistant, an automation, the EchoMuse dashboard, or
+another remote player shows that same cyan arc. It is off by default because
+remote changes can otherwise make the ring light unexpectedly. Physical
+volume buttons always show the arc. Setting volume to zero (including Home
+Assistant mute), repeating the current level, and restoring the saved volume
+at boot never do. Older firmware shows the setting disabled until updated.
+
 ### How a turn ends
 The ring tells you *why* a conversation stopped, using rhythm rather than
 colour (red, orange and cyan already mean mute, no-controller and volume):
@@ -716,14 +736,46 @@ Two things to know before enabling:
   Android's stack** (it survives reboots). Nothing EchoMuse uses needs
   Android Bluetooth — but stock-style Bluetooth speaker pairing stops being
   possible on that device.
-- The proxy is **receive-only** (passive scanning). Devices that need an
-  active connection to read data (some smart locks, older BLE devices)
-  aren't supported — advert-based sensors and presence tracking are.
+- On its own the proxy is **receive-only** (passive scanning). Devices that
+  need a connection to read data or take commands need **Allow connections**
+  as well, below.
 - The Dot's WiFi and Bluetooth **share one antenna**, and scanning costs the
   WiFi link. So the scan **pauses automatically** while the Dot is hearing
   you, while a reply is arriving, and while its console or an update is
   running, then resumes; presence tracking loses a few seconds per voice
   turn.
+
+**Allow connections** — lets Home Assistant connect to Bluetooth devices
+through the Dot: smart locks, SwitchBot, anything that needs more than its
+advertisements. Off by default. It needs **Bluetooth proxy** on, and firmware
+that supports it (the toggle says so when it does not).
+
+Turning it on changes one thing you have to act on: **the proxy's Home
+Assistant connection becomes encrypted, and Home Assistant will ask for an
+encryption key.** Save the setting, press **Show encryption key** under the
+toggle (admin only), and paste it into Home Assistant when the `<label> BT
+Proxy` device asks to be reconfigured. Until you do, that proxy stops
+delivering advertisements too, because Home Assistant cannot connect to it.
+The key stays the same for that Dot from then on.
+
+The key is required, with no option to skip it: a connection can operate
+whatever is at the other end, and without it anything on your network could
+use the proxy to do so. Treat the key like a password. Turning connections
+off again makes the proxy unencrypted and ends any open connection.
+
+Limits to know:
+
+- **Three connections per Dot** at a time.
+- **No pairing.** Devices that require Bluetooth pairing (bonding) will
+  refuse; most locks and SwitchBot devices encrypt in their own app layer
+  and do not need it.
+- **A held connection costs presence tracking.** The scan shares the radio
+  with the connection: the Dot catches roughly half as many advertisements
+  while a connection is open. A connection goes to a slower rhythm after
+  five seconds idle to keep that cost down, so the first command after a
+  quiet spell takes about a second.
+- Connections end when the Dot loses its controller, and Home Assistant
+  reconnects them.
 
 Diagnostics live on the device's **Status tab** (Bluetooth proxy panel):
 scanner state, advertisements seen, nearby device count, and whether Home

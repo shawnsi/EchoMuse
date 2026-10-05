@@ -660,7 +660,7 @@ function ControllerEndpointsField({ value, onChange, readOnly = false }) {
 // VISIBLE and disabled: the capability rule is that a device lacking a feature
 // shows the control with the reason, and a native select would hide the option
 // entirely, which reads as the feature not existing at all.
-function Select({ label, sub, value, options, onChange }) {
+function Select({ label, sub, value, options, onChange, disabled = false }) {
   return (
     <div style={{ marginBottom: 20, minWidth: 0 }}>
       <div style={{ marginBottom: 7, minWidth: 0 }}>
@@ -673,9 +673,9 @@ function Select({ label, sub, value, options, onChange }) {
             key={o.value}
             role="radio" aria-checked={o.value === value}
             className={'em-pill em-pill--small' + (o.value === value ? ' em-pill--accent' : '')}
-            disabled={!!o.disabled}
+            disabled={disabled || !!o.disabled}
             style={{ flex: 1, minWidth: 0 }}
-            onClick={() => { if (!o.disabled) onChange(o.value); }}>
+            onClick={() => { if (!(disabled || o.disabled)) onChange(o.value); }}>
             {o.label}
           </button>
         ))}
@@ -2083,6 +2083,18 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
               <CircleButton onClick={onClose} title="Close">×</CircleButton>
             </div>
           </div>
+          {/* What deleting leaves behind in Home Assistant (#375). Full width
+              and under the header row, not beside Confirm: a sentence that
+              fits next to a button is not read, and the port it names is the
+              whole value of it. Same amber notice surface as the controller
+              update banner — `em-on-dark` for the dark-theme text tokens it
+              implies, `--notice-bg` for the panel. */}
+          {isAdmin && confirmDelete && (
+            <div className="em-on-dark" style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 12, padding: '10px 14px', background: 'var(--notice-bg)', border: '1px solid var(--notice-line)', borderRadius: 8, fontFamily: "'DM Sans',sans-serif", fontSize: 12, color: 'var(--text)', lineHeight: 1.5 }}>
+              <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, textTransform: 'uppercase', letterSpacing: '0.12em', color: 'var(--warn)', fontWeight: 600, flexShrink: 0 }}>Home Assistant</span>
+              <span>{_deleteHaWarning(device)}</span>
+            </div>
+          )}
           {device.approved ? (
             <div className="em-tabs" style={{ display: 'flex', gap: 2 }}>
               {TABS.map(t => (
@@ -2157,6 +2169,7 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
               ? `${s.cpuPct.toFixed(0)}%` + (s.coresOnline ? ` · ${s.coresOnline}/${s.coresTotal ?? '?'} cores` : '')
               : null;
             const lq = device.linkQuality;   // loss verdict + per-minute strip (em_tcp)
+            const linkRow = _linkRow(device); // TLS + token, not TLS alone (#590)
             // Thermals: mtktscpu is the CPU zone, maxTempC the hottest of all
             // 11 zones (the PMIC and board sensors can run warmer). Amber past
             // 70C, red past 85C — well below this SoC's limits, because the
@@ -2229,15 +2242,11 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                          : (s?.volumePct != null ? `${s.volumePct}%` : '—'))}
                     {/* An offline Echo the controller is turning away says why,
                         in the row that describes its link rather than a new one. */}
-                    {row('Link', device.connected
-                           ? (device.linkTls ? 'wss (TLS)' : 'plain ws')
-                           : device.linkRefused
-                             ? <span title="Remove this Echo and approve it again to pair it.">
-                                 {`Refused: ${device.linkRefused.reason}`}
-                               </span>
-                             : '—',
-                         device.connected ? (device.linkTls ? 'var(--ok)' : 'var(--warn)')
-                           : device.linkRefused ? 'var(--error)' : undefined)}
+                    {row('Link',
+                         linkRow.refused
+                           ? <span title="Remove this Echo and approve it again to pair it.">{linkRow.label}</span>
+                           : linkRow.label,
+                         linkRow.color)}
                     {/* The eMMC's own wear report and how the current boot
                         started (schema v28). A watchdog or panic boot is the
                         sign of a hang nobody saw. Both are absent on firmware
@@ -2447,9 +2456,16 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 listen={device.connected ? device.listen : null}
                 wakeCueCapable={!device.connected || !!device.wakeCueCapable}
                 volumeCueCapable={!device.connected || !!device.volumeCueCapable}
+                remoteVolumeArcCapable={!device.connected || !!device.remoteVolumeArcCapable}
+                responseLevelCapable={!device.connected || !!device.responseLevelCapable}
+                wakeMicCapable={!device.connected || !!device.wakeMicCapable}
                 sendspinCapable={!device.connected || !!device.sendspinCapable}
                 sendspinPanel={device.connected && device.sendspinCapable
                   ? <SendspinPairing deviceId={device.device_id} status={device.sendspin} isAdmin={isAdmin}/>
+                  : null}
+                bleConnectCapable={!device.connected || !!device.bleConnectCapable}
+                blePanel={device.connected && device.bleConnectCapable
+                  ? <BleProxyKey deviceId={device.device_id} status={device.bleProxy} isAdmin={isAdmin}/>
                   : null}
                 mixCapable={!device.connected || !!device.audioMixCapable}
                 holdCapable={!device.connected || !!device.buttonHoldCapable}
@@ -3263,6 +3279,36 @@ function _baseOsLabel(baseOs) {
   return baseOs === 'emos' ? 'emOS' : baseOs === 'fireos' ? 'FireOS 5' : null;
 }
 
+// What the Status tab's Link row reads, and in what colour.
+//
+// "wss (TLS)" in green is the check everybody runs before flipping
+// REQUIRE_DEVICE_TLS, so it must not be printed for a link the controller has
+// no token for. em_linkauth.decide rule 4 wants secure AND presented AND
+// expected: a device connected over TLS with nothing on record clears the
+// first two and is locked out by the flip, while its card looked perfect.
+// Seen on the EA controller 2026-09-20 — one device logging "token presented
+// but none on record" on every plane on every dial, reading green throughout.
+//
+// Encrypted is not authenticated, so a missing token is amber whatever the
+// transport is: the row is the answer to "is this link safe", and green
+// asserts more than the controller can support.
+//
+// An ABSENT linkTokenIssued is not a measurement. A dashboard served by an
+// older controller has never heard of the field, so it keeps today's reading
+// rather than claiming "no token" on every device at once — the same
+// NULL-not-zero rule the rest of this file lives by.
+function _linkRow(device) {
+  if (!device.connected) {
+    return device.linkRefused
+      ? { label: `Refused: ${device.linkRefused.reason}`, color: 'var(--error)', refused: true }
+      : { label: '—', color: undefined };
+  }
+  if (!device.linkTls) return { label: 'plain ws', color: 'var(--warn)' };
+  return device.linkTokenIssued === false
+    ? { label: 'wss (TLS) · no token', color: 'var(--warn)' }
+    : { label: 'wss (TLS)', color: 'var(--ok)' };
+}
+
 // The kernel's word size from `uname -m`: "64-bit" or "32-bit". On biscuit it
 // is what separates emOS on FireOS 5's kernel from emOS on FireOS 6's — same
 // ARMv8 chip, both 3.18.19, one kernel built 32-bit.
@@ -3298,6 +3344,24 @@ function _kernelLabel(d) {
 function _kernelTitle(d) {
   return d.kernelArch ? `kernel ${d.kernelArch} ${d.kernelRelease || ''}`.trim() : null;
 }
+
+// What deleting a device leaves behind in Home Assistant (#375). The identity
+// is derived from the serial — so a re-approved device keeps the name and MAC
+// HA has already made an entry for — but the port is not, and the re-added one
+// is allocated fresh. HA is left pointing at a port nobody listens on, and
+// discovery will not offer it again. Naming that port is what the operator has
+// to go and match in HA.
+//
+// A NULL port is a device that never had a satellite, so there is no number to
+// name — the sentence still has to say it. `!= null` rather than a truthiness
+// test, so a 0 is reported as 0 instead of swallowed: absence stores as NULL,
+// never 0.
+const _deleteHaWarning = (d) => {
+  const who  = (d && (d.label || d.device_id)) || 'this device';
+  const port = d && d.esphome_port != null ? ` on port ${d.esphome_port}` : '';
+  return `Home Assistant keeps its entry for ${who}${port}. Delete it there `
+       + `before adding this Echo back.`;
+};
 
 const _INIT_RC_APPEND = `
 service mixer /system/bin/sh
@@ -3335,6 +3399,9 @@ service echomuse /data/local/bin/start_server.sh
 //             v1 leaves expdb alone. Checked in recovery only: it needs root.
 //   twrp    — the TWRP version. v2 installs 3.7.0_9-0, v1 ships 3.2.3-0.
 //             Compared numerically, so 3.10 is not read as older than 3.7.
+//             3.7.0_9-bboeN is the exception: overdub's dot_firmware.py
+//             installs it on v1 in place of 3.2.3, and its 64-bit kernel
+//             boots only on v1's LK, so it is never evidence of v2.
 //   release — the Android release that MATTERS: getprop in Android, but
 //             /system's build.prop in recovery, because TWRP answers getprop
 //             with its own ramdisk. FireOS 6 is Android 7.1; v1 boots only
@@ -3343,7 +3410,9 @@ const _unlockVerdict = ({ release = '', expdb = '', twrp = '' }) => {
   const evidence = [];
   if (expdb.toLowerCase() === '88168858') evidence.push('a bootloader image in expdb');
   const tv = twrp.match(/(\d+)\.(\d+)/);
-  if (tv && (+tv[1] > 3 || (+tv[1] === 3 && +tv[2] >= 7))) evidence.push(`TWRP ${twrp}`);
+  if (tv && (+tv[1] > 3 || (+tv[1] === 3 && +tv[2] >= 7)) && !/^3\.7\.0_9-bboe\d+$/.test(twrp)) {
+    evidence.push(`TWRP ${twrp}`);
+  }
   const major = parseInt(release, 10);
   if (major >= 6) evidence.push(`Android ${release}, which is FireOS 6`);
   return { v2: evidence.length > 0, evidence };
@@ -4292,15 +4361,24 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     boot_target:   'readlink -f /dev/block/other-boot 2>&1',
   };
 
-  async function collectProvisionDiagnostics(c, stepIdx, err) {
+  // The emOS serial steps have no ADB, so they ask over the console instead.
+  // net.log is the only place the supplicant and the DHCP client write, and
+  // "associated, still no address" (#767) cannot be told apart from a wrong
+  // password without it. The ntpd line repeats every nine minutes for as long
+  // as the device has no time server and would fill the tail.
+  const _EMOS_PROBES = {
+    net_log:       "grep -v '^ntpd: timed out' /run/net.log | tail -n 200",
+  };
+
+  async function collectProvisionDiagnostics(run, probeList, stepIdx, err) {
     const probes = {};
-    for (const [name, cmd] of Object.entries(_PROVISION_PROBES)) {
+    for (const [name, cmd] of Object.entries(probeList)) {
       try {
         // Bounded per probe. The device has just failed something and may be
         // half gone; without this, one unanswered command hangs the whole
         // collection and the operator gets nothing at all.
         probes[name] = await Promise.race([
-          c.shell(cmd),
+          run(cmd),
           new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
         ]);
       } catch (e) {
@@ -4320,7 +4398,11 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     // adbRef, not adb: this runs from runStep's catch, in the same async
     // callback that connected.
     const c = adbRef.current;
-    if (!c) {
+    // On the emOS serial steps adbd is gone and the console is the only way
+    // in. Decided by the step, not by whether an ADB handle is still held: a
+    // stale one would spend 8s per probe timing out and never ask the console.
+    const con = (isEmos && _EMOS_SERIAL_STEPS.has(stepIdx)) ? emosConsole : null;
+    if (!con && !c) {
       // No connection means no probes, and a button that downloads a file
       // containing nothing but the error would be worse than no button.
       addLog('No ADB connection, so device state could not be captured.', 'warn');
@@ -4328,7 +4410,9 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     }
     addLog('Capturing device state for diagnostics…');
     try {
-      setDiagnostics(await collectProvisionDiagnostics(c, stepIdx, err));
+      setDiagnostics(con
+        ? await collectProvisionDiagnostics(cmd => con.run(cmd, 8000), _EMOS_PROBES, stepIdx, err)
+        : await collectProvisionDiagnostics(cmd => c.shell(cmd), _PROVISION_PROBES, stepIdx, err));
       addLog('Device state captured — "Download diagnostics" below.', 'ok');
     } catch (e) {
       // Never let the diagnostic path bury the real failure.
@@ -5160,14 +5244,14 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     } else if (!tw) {
       unreadable = true;
       why.push('the wizard could not read the TWRP version');
-    } else if (v2Boot && /^3\.7\.0(?![0-9])/.test(tw) && layout === 'v2') {
+    } else if (v2Boot && /^3\.7\.0(?![0-9])(?!_9-bboe)/.test(tw) && layout === 'v2') {
       gen = 6;
-    } else if (!v2Boot && /^3\.2\.3(?![0-9])/.test(tw) && layout === 'v1') {
+    } else if (!v2Boot && /^3\.2\.3(?![0-9])|^3\.7\.0_9-bboe\d+$/.test(tw) && layout === 'v1') {
       gen = 5;
     } else {
       why.push(`the unlock does not add up: expdb ${v2Boot ? 'holds' : 'does not hold'} `
         + `amonet 2's bootloader, TWRP is ${tw}, and the boot partitions are laid out `
-        + `for amonet ${layout === 'v2' ? 2 : 1} (amonet 1 means TWRP 3.2.3 and FireOS 5; `
+        + `for amonet ${layout === 'v2' ? 2 : 1} (amonet 1 means TWRP 3.2.3 or 3.7.0_9-bboe and FireOS 5; `
         + 'amonet 2 means TWRP 3.7.0 and FireOS 6)');
     }
     if (gen) {
@@ -8751,12 +8835,16 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
                     on their own hardware, and the wrong reaction (power
                     cycling) is what makes a recoverable Echo unrecoverable. */}
                 <p style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--text2)', lineHeight: 1.7, margin: '10px 0 0' }}>
-                  <strong>If it does not come up, do not keep power cycling it</strong> — that turns a
-                  recoverable Echo into a case-opening job. Instead: unplug it, hold <strong>mute</strong> or{' '}
-                  <strong>+</strong> (<a href="https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-2nd-gen-2016-biscuit.4761416/" target="_blank"
-                  rel="noreferrer">which one depends on your amonet version</a>) and plug it back in to
-                  reach TWRP, reconnect here and use <strong>Restore escrowed boot image</strong>. About
-                  ten seconds, and /data is untouched.
+                  <strong>Only two of those need you</strong> — <strong>red, stopped</strong>, or{' '}
+                  <strong>one segment orbiting a full blue ring for more than a minute</strong>.
+                  Anything else means emOS is still starting, so leave it to finish;
+                  power cycling a recoverable Echo is what turns it into a
+                  case-opening job. For either of the two: unplug it, hold{' '}
+                  <strong>mute</strong> or <strong>+</strong> (<a href="https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-2nd-gen-2016-biscuit.4761416/" target="_blank"
+                  rel="noreferrer">which one depends on your amonet version</a>) and plug it
+                  back in to reach TWRP, reconnect here and use{' '}
+                  <strong>Restore escrowed boot image</strong>. About ten seconds, and /data
+                  is untouched.
                 </p>
               </div>
             )}
@@ -8805,6 +8893,18 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
               <div className="em-panel em-wizard-recovery">
                 <div className="em-label">This step failed</div>
                 <p className="em-wizard-recovery__hint">{recoveryHint()}</p>
+                {/* The same warning the Detail modal's delete gives (#375).
+                    The matched device is resolved out of knownDevices rather
+                    than carried across, so the port is named here too — only
+                    its id survives on the error. */}
+                {step === 0 && duplicateDeviceId && (() => {
+                  const dup = (knownDevices || []).find(d => d && d.device_id === duplicateDeviceId);
+                  return (
+                    <p className="em-wizard-recovery__hint" style={{ color: 'var(--warn)' }}>
+                      {_deleteHaWarning(dup || { device_id: duplicateDeviceId })}
+                    </p>
+                  );
+                })()}
                 <div className="em-wizard-recovery__actions">
                   <Pill accent onClick={() => runStep(step)}>Retry</Pill>
                    {!CONNECT.has(step) && (
@@ -9129,12 +9229,12 @@ const STAGE_MONO = "'DM Mono',monospace";
 // control sitting under a toggle that does not govern it would look fine and
 // be silently wrong.
 const CONFIG_SECTIONS = {
-  "playback": ["eqBands", "eqLoudness", "duckDb", "limiterEnabled", "limiterThreshold", "limiterRelease", "bassGuardEnabled", "bassGuardDb", "streamReply", "volumeButtonSound"],
+  "playback": ["eqBands", "eqLoudness", "duckDb", "responseLevel", "limiterEnabled", "limiterThreshold", "limiterRelease", "bassGuardEnabled", "bassGuardDb", "streamReply", "volumeButtonSound"],
   "wakeword": ["owwModel", "owwThreshold", "owwSpeexNs", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "owwOnDevice", "wakeSound", "wakeSoundLevel", "wakeClipCapture", "wakeClipMinScore"],
-  "microphones": ["adcMicpga", "adcDigitalGain", "micGainDb", "beamformingEnabled", "beamAngle", "wakeMic", "aecEnabled", "aecDelayMs", "aecTailMs", "aecRefSource", "nsAsr", "saveUtterances"],
-  "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
-  "advanced": ["agcEnabled", "vadThreshold", "vadSpeechMs", "vadSilenceMs", "buttonSingleTapEvent", "buttonMultiTapMs", "consolePassword", "consoleTimeoutMin", "controllerEndpoints"],
-  "bluetooth": ["bleProxyEnabled"],
+  "microphones": ["adcMicpga", "adcDigitalGain", "micGainDb", "beamformingEnabled", "beamAngle", "aecEnabled", "aecDelayMs", "aecTailMs", "aecRefSource", "nsAsr", "saveUtterances"],
+  "ring": ["ledScene", "ledListenColor", "ledThinkColor", "remoteVolumeArc", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
+  "advanced": ["agcEnabled", "vadThreshold", "vadSpeechMs", "vadSilenceMs", "wakeMic", "buttonSingleTapEvent", "buttonMultiTapMs", "consolePassword", "consoleTimeoutMin", "controllerEndpoints"],
+  "bluetooth": ["bleProxyEnabled", "bleProxyConnections"],
   "sendspin": ["sendspinEnabled", "sendspinUnpaired"]
 };
 
@@ -9294,8 +9394,12 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                             localCapable = true, listen = null,
                             hwEchoRef = false, hwRefCapable = true,
                             emosFleet = true, wakeCueCapable = true,
-                            volumeCueCapable = true, sendspinCapable = true,
-                            sendspinPanel = null }) {
+                            volumeCueCapable = true,
+                            remoteVolumeArcCapable = true,
+                            responseLevelCapable = true,
+                            wakeMicCapable = true,
+                            sendspinCapable = true, sendspinPanel = null,
+                            bleConnectCapable = true, blePanel = null }) {
   // emosFleet defaults TRUE for the same reason the capability props above do,
   // and for one more: it gates the console password, which is emOS-only, and
   // disabling a setting because we do not KNOW the fleet has an emOS device
@@ -9522,6 +9626,20 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
               <Toggle label="Speak while the reply is written"
                 sub="faster with a quick model; a slow one may pause"
                 value={config.streamReply ?? false} onChange={v => set('streamReply', v)}/>
+            </div>
+            <div style={{ marginTop: 8, ...inputStyle }}>
+              <Select label="Response level"
+                sub={responseLevelCapable
+                  ? "voice responses relative to device volume; boost tapers near maximum"
+                  : "needs newer firmware on this Echo"}
+                disabled={!responseLevelCapable}
+                value={config.responseLevel ?? 'low'}
+                options={[
+                  { value: 'low', label: 'Low (normal)' },
+                  { value: 'medium', label: 'Medium (+6 dB)' },
+                  { value: 'high', label: 'High (+12 dB)' },
+                ]}
+                onChange={v => set('responseLevel', v)}/>
             </div>
             {/* Speaker protection: ONE toggle for the bass guard, and the
                 limiter is not offered at all.
@@ -9772,7 +9890,6 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
             <Slider label="Digital gain" sub="ADC digital gain — affects wake + turns" value={config.adcDigitalGain ?? 88} min={0} max={100} onChange={v => set('adcDigitalGain', v)}/>
             <Slider label="Mic gain" sub="fixed gain on the 24-bit capture, pre-16-bit stream" value={config.micGainDb ?? 24} min={0} max={42} unit="dB" onChange={v => set('micGainDb', v)}/>
             <Slider label="Beam angle" sub="-1 = auto (onset-ratio selection)" value={config.beamAngle ?? -1} min={-1} max={359} step={1} onChange={v => set('beamAngle', v)}/>
-            <Slider label="Wake-word mic" sub="0 = centre (default). 1-6 = MK1-MK6: only for a dead centre mic" value={config.wakeMic ?? 0} min={0} max={6} step={1} onChange={v => set('wakeMic', v)}/>
             <Toggle label="Beamforming" sub="perimeter mic lock during turns" value={config.beamformingEnabled ?? false} onChange={v => set('beamformingEnabled', v)}/>
             <Toggle label="Echo cancel (AEC)" sub="subtracts the device's own playback — wake + turns" value={config.aecEnabled ?? false} onChange={v => set('aecEnabled', v)}/>
             <Toggle label="Noise suppression" sub="DTLN denoise on speech-to-text audio only — helps fans/hum, not TV speech" value={config.nsAsr ?? false} onChange={v => set('nsAsr', v)}/>
@@ -9868,6 +9985,13 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
             </div>
           )}
         </div>
+        <div style={{ marginTop: 14, ...inputStyle }}>
+          <Toggle label="Remote volume arc"
+            sub={remoteVolumeArcCapable ? 'shows the cyan level arc for non-zero Home Assistant and other remote volume changes' : 'needs newer firmware on this Echo'}
+            disabled={!remoteVolumeArcCapable}
+            value={config.remoteVolumeArc ?? false}
+            onChange={v => set('remoteVolumeArc', v)}/>
+        </div>
         <StageAdvanced open={advRing} onToggle={() => setAdvRing(o => !o)} disabledStyle={inputStyle}>
           <div style={{ fontFamily: mono, fontSize: 10, color: 'var(--text2)', lineHeight: 1.6, marginBottom: 12 }}>
             While a response plays, the ring throbs with the live speaker level. These shape how
@@ -9950,6 +10074,24 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
         <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px', ...inputStyle }}>
           <Toggle label="Auto gain (AGC)" sub="levels button-turn speech; never the wake stream" value={config.agcEnabled ?? true} onChange={v => set('agcEnabled', v)}/>
         </div>
+        {/* An escape hatch for a dead centre mic (#705), so it sits here and
+            not with the microphone gains. Disabled with the reason on
+            firmware that ignores the key. */}
+        <div style={inputStyle}>
+          <Select label="Wake word microphone"
+            sub={wakeMicCapable
+              ? 'Centre unless that mic has failed; MK1 to MK6 are the ones around the edge'
+              : 'needs newer firmware on this Echo'}
+            disabled={!wakeMicCapable}
+            value={config.wakeMic ?? 0}
+            options={[
+              { value: 0, label: 'Centre' },
+              { value: 1, label: 'MK1' }, { value: 2, label: 'MK2' },
+              { value: 3, label: 'MK3' }, { value: 4, label: 'MK4' },
+              { value: 5, label: 'MK5' }, { value: 6, label: 'MK6' },
+            ]}
+            onChange={v => set('wakeMic', v)}/>
+        </div>
         {subHeader('Speech gate')}
         <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '4px 20px', ...inputStyle }}>
           <Slider label="Threshold" sub="RMS above this = speech (pre-gain units)" value={config.vadThreshold ?? 0.001} min={0.0001} max={0.02} step={0.0001} onChange={v => set('vadThreshold', v)}/>
@@ -9962,9 +10104,15 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
       <Stage n="06" title="Bluetooth"
         chips={<><ScopeChip tone="device">Device</ScopeChip><ScopeChip tone="controller">Controller</ScopeChip></>}
         desc="Turns the device into a Home Assistant Bluetooth proxy: it passively listens for BLE advertisements (presence beacons, temperature sensors) and forwards them to HA as a separate ESPHome device — independent of the voice assistant. Enabling permanently switches the Dot's Bluetooth chip away from Android's stack (Bluetooth speaker pairing, never used by EchoMuse, stops being possible)."
-        scope={scopeEl('bluetooth')} dim={secStyle('bluetooth')}>
+        scope={scopeEl('bluetooth')} dim={secStyle('bluetooth')}
+        after={(config.bleProxyConnections ?? false) ? blePanel : null}>
         <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px', ...inputStyle }}>
           <Toggle label="Bluetooth proxy" sub="passive BLE scan → HA (Bermuda, BLE sensors)" value={config.bleProxyEnabled ?? false} onChange={v => set('bleProxyEnabled', v)}/>
+          <Toggle label="Allow connections"
+            sub={bleConnectCapable ? 'proxy goes offline in HA until you enter its key' : 'needs newer firmware on this Echo'}
+            disabled={!bleConnectCapable || !(config.bleProxyEnabled ?? false)}
+            value={config.bleProxyConnections ?? false}
+            onChange={v => set('bleProxyConnections', v)}/>
         </div>
       </Stage>
 
@@ -9987,6 +10135,59 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
             onChange={v => set('sendspinUnpaired', v)}/>
         </div>
       </Stage>
+    </div>
+  );
+}
+
+// BleProxyKey: one Echo's Bluetooth connection slots, and the encryption key
+// Home Assistant asks for once connections are on (the proxy's port requires
+// it from then). Fetched on request and never kept, like the Sendspin token.
+function BleProxyKey({ deviceId, status, isAdmin }) {
+  const mono = "'DM Mono',monospace";
+  const [key, setKey] = useState(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const show = async () => {
+    setBusy(true); setError('');
+    try {
+      const r = await API.get(`/api/devices/${deviceId}/ble_proxy/key`);
+      setKey(r.key);
+    } catch (e) {
+      setError(e.error || e.message || 'Could not get the key');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const copy = () => {
+    navigator.clipboard.writeText(key).then(() => setCopied(true)).catch(() => {});
+  };
+
+  const on = !!(status && status.connections);
+  let line = 'Save to turn connections on';
+  if (on) {
+    line = status.slotsLimit
+      ? `${status.slotsFree} of ${status.slotsLimit} connections free`
+      : 'Waiting for the Echo';
+    if (!status.haConnected) line += ' · Home Assistant not connected';
+  }
+
+  return (
+    <div style={{ fontFamily: mono, fontSize: 11, color: 'var(--text2)', display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div>{line}</div>
+      {on && isAdmin && !key && (
+        <div><Pill small disabled={busy} onClick={show}>{busy ? 'Fetching…' : 'Show encryption key'}</Pill></div>
+      )}
+      {key && (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', minWidth: 0 }}>
+          <span style={{ wordBreak: 'break-all', userSelect: 'all' }}>{key}</span>
+          <Pill small onClick={copy}>{copied ? 'Copied' : 'Copy'}</Pill>
+          <Pill small onClick={() => { setKey(null); setCopied(false); }}>Hide</Pill>
+        </div>
+      )}
+      {key && <div style={{ color: 'var(--muted)', fontSize: 10 }}>Home Assistant asks for this on the BT Proxy device. Anyone with it can use this Echo's connections.</div>}
+      {error && <div style={{ color: 'var(--error)' }}>{error}</div>}
     </div>
   );
 }
